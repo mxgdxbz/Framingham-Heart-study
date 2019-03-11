@@ -1,0 +1,250 @@
+---
+title: "Framingham Heart study"
+author: "CHUHAN"
+date: "12/3/2018"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+For this analysis, we are interested to describe the smoking habits of the participants in the Framingham Heart study as they age and the impact of smoking on certain health outcomes. The Framingham heart study asks participants about their smoking habits at each visit. In particular, participants are asked if they are currently smoking at this visit (0 = Not a current smoker, 1 = Current smoker), which we will refer to as current smoking status. In addition, participants also report the number of cigarettes they are smoking per day. A more complete description of each of variables in the Framingham Heart study can be found in the Framingham Heart Study Longitudinal Data Documentation. 
+
+## Part1
+we are interested to answer the following questions:
+(1) Is there a relationship between age and smoking status? Does this relationship differ by sex?
+(2) Is there a relationship between the number of cigarettes smoked per day and age? Does this relationship differ by sex?
+
+### Data Preparation
+The dataset contains 11,627 observations on 4,434 participants - each participant could have up to three observations depending on the number of exams each subject attended.
+```{r setup,warning=FALSE}
+library(tidyverse)
+library(nlme)
+library(mice)
+library(lme4)
+library(ggplot2)
+library(gridExtra)
+smoking=read.csv("frmgham2.csv")%>%
+  janitor::clean_names()%>%
+  dplyr::select(randid, period, age, sex, cursmoke, cigpday,bpmeds, educ, bmi, diabetes,heartrte, prevstrk, prevhyp, sysbp, diabp, totchol) %>% 
+  mutate(sex = as.factor(sex),
+         sex = fct_recode(sex, man = "1", woman = "2"),
+         educ = as.factor(educ),
+         educ = recode(educ, '1'='0-11 years', '2'='High School Diploma, GED',
+                       '3'='Some College, Vocational School', 
+                       '4'='College (BS, BA) degree or more'),
+         bmi=ifelse(bmi<18.5,"underweight",ifelse(bmi<25,"normal","overweight")),
+         bmi=as.factor(bmi),
+         diabetes = as.factor(diabetes),
+         prevstrk = as.factor(prevstrk),
+         prevhyp = as.factor(prevhyp))
+names(smoking)
+dim(smoking)
+```
+
+### Missing machanism
+We first check missing pattern of the variables we thought might be related to the smoking status. It shows that we have 11210 complete observations without any missing information on age, sex, somking status, number of cigarettes per day, bmi as well as educational level.
+```{r}
+md.pattern(smoking[,c(3,4,6,8,9,5)], plot = TRUE)
+```
+
+Next, we checked the missing machanism for variable **cigpday**. The results gave us the support to our assumption that missing values in **cigpday** are missing at random(MAR). We could ues mice pakage in R to impute the missing values.
+```{r}
+spre_cigpd <- smoking%>%
+select(randid, cigpday, period)%>% 
+  spread(period, cigpday)%>%
+  mutate(state2 = ifelse(is.na(`2`), 1, 0), state3 = ifelse(is.na(`3`), 1, 0))
+logis <- glm(state2~`1`, data= spre_cigpd,family = binomial)
+summary(logis) 
+logis1 <- glm(state3~`2`+`1`, data= spre_cigpd,family = binomial) 
+summary(logis1)
+```
+
+### Removing outliers
+Specifically, we filtered out observations with systolic blood pressure over 250, diastolic blood pressure over 150, and total cholesterol over 500 based on our findings from literature review[1]. We excluded a total of 27 observations in this step.
+```{r}
+hist(smoking$sysbp)
+hist(smoking$diabp)
+hist(smoking$totchol)
+
+sysbp.ol=smoking[which(smoking$sysbp>=250),]$randid
+diabp.ol=smoking[which(smoking$diabp>=150),]$randid
+totchol.ol=smoking[which(smoking$totchol>=500),]$randid
+ol.id=unique(c(sysbp.ol,diabp.ol,totchol.ol));ol.id
+smoking2=smoking %>%
+  filter(! randid  %in% ol.id)
+```
+
+### Exploration of potential confounders
+Potential confounders were selected through literature review at first. We found that hypertension, bmi and education level might associate with participants'age, sex as well as their smoking status. Thus we mainly focused on these variables here and visualized their impact on the relationship between age and sex with smoking. 
+
+```{r}
+confounder <-smoking2 %>% 
+  select(randid,cursmoke,age,sex, educ, bmi,prevhyp,cigpday) %>%
+  filter(!is.na(bmi))
+
+#gender
+ggplot(confounder,aes(x=age,y=cursmoke))+
+  geom_jitter(height = 0.2, width = 3) +
+  geom_smooth()+facet_wrap(~sex) +labs(title="Smoking Status vs.age stratified by sex") 
+
+#educ
+ggplot(confounder,aes(x=age,y=cursmoke,color=sex))+
+  #geom_jitter(height = 0.2, width = 3) +
+  geom_smooth()+facet_wrap(~educ)+labs(title="Smoking status vs.age stratified by education level") 
+
+#hypr
+ggplot(confounder,aes(x=age,y=cursmoke,color=sex))+
+  #geom_jitter(height = 0.2, width = 3) +
+  geom_smooth()+facet_wrap(~prevhyp)+labs(title="Smoking status vs.age stratified by hypertension") 
+
+#bmi
+ggplot(confounder,aes(x=age,y=cursmoke,color=sex))+
+  #geom_jitter(height = 0.2, width = 3) +
+  geom_smooth()+facet_wrap(~bmi)+labs(title="Smoking status vs.age stratified by BMI") 
+```
+
+## Part2
+###Relationship between age and smoking status
+Based on the above plots, the trends under different levels of **education**, **hypertension** and **bmi** seem to distinguish from each other. Thus we built a confounder select function based on the rule of thumb criteria to decide whether to include these potential confounders in the model. This function would fit a model with and without the potential confounder separately. Then the coefficient of the “confounded” variable will be checked to see whether it is still within the 95% confidence interval of the coefficient in model without this variable.
+```{r,warning=FALSE}
+# confounder detect function
+find_cnfd <- function(data, Y, method = method) { 
+  colnames(data)[Y] <- "Y"
+  data_cf <- data %>%
+    select(-age,-sex,-Y,-randid)
+  cf_tbl <- tibble() 
+    glme1 <- glmer(Y ~ age+sex + (1|randid), data = data, family = method) 
+    est1 <- summary(glme1)$coefficients[2] 
+    ci_upper1 <- est1 + qnorm(0.975) * summary(glme1)$coefficients[5] 
+    ci_lower1 <- est1 - qnorm(0.975) * summary(glme1)$coefficients[5] 
+    est2 <- summary(glme1)$coefficients[3] 
+    ci_upper2 <- est2 + qnorm(0.975) * summary(glme1)$coefficients[6] 
+    ci_lower2 <- est2 - qnorm(0.975) * summary(glme1)$coefficients[6] 
+
+     for(i in 1:ncol(data_cf)){ 
+      term_i <- names(data_cf)[i]
+      glme2 <-  glmer(Y ~ age+sex + data_cf[,i] + (1|randid), data=data, family = method)       
+      cf1 <- summary(glme2)$coefficients[2] 
+      cf2 <- summary(glme2)$coefficients[3] 
+      cf_tbl_i <- tibble(potential_confounder = term_i, est_of_age = cf1, est_of_sex=cf2, ci_upper1 = ci_upper1, ci_lower1 = ci_lower1,ci_upper2 = ci_upper2, ci_lower2 = ci_lower2) %>%     
+      mutate(confounder = (cf1 > ci_upper1 | cf1 < ci_lower1) | (cf2 > ci_upper2 | cf1 < ci_lower1)) 
+      cf_tbl <- rbind(cf_tbl, cf_tbl_i)
+     }
+      cf_tbl <- cf_tbl %>% select(potential_confounder, est_of_age,est_of_sex, confounder) 
+      return(list(table = cf_tbl, CI_age = c(ci_lower1, ci_upper1), CI_sex = c(ci_lower2, ci_upper2)))
+}
+
+
+#find_cnfd(data =confounder, Y=2, method = "binomial")
+```
+
+No other confounder was found to impact the relationship between age and sex with current smoking status. Thus we only included age, sex and their interaction as covariates. To study the association between age(or sex) and smoking status, we fitted several logistic regression models with mixed effect. Then, we seleced the final model based on AIC criteria. 
+
+```{r, warning=FALSE}
+#random intercept without interaction  
+fit1=glmer(cursmoke ~ age + sex + (1|randid), data =smoking2, family = binomial)
+#random intercept with interaction
+fit2=glmer(cursmoke ~ age*sex + (1|randid), data =smoking2, family = binomial)
+#random intercept and slope without interaction
+fit3=glmer(cursmoke ~ age + sex + (age|randid), data =smoking2, family = binomial)
+#random intercept and slope without interaction
+fit4=glmer(cursmoke ~ age*sex + (age|randid), data =smoking2, family = binomial)
+
+# model selection
+tibble(model = c("model1","model2","model3", "model4"), AIC = c(summary(fit1)$AIC[1],summary(fit2)$AIC[1],
+summary(fit3)$AIC[1],summary(fit4)$AIC[1]))
+```
+
+**model2** with random intercept and interaction term ends with the lowest AIC value, so we chose model2 as our final model. Next, we made a residual plot to visualize the model fitting.
+
+```{r}
+best.fit=fit2
+plot(predict(best.fit),residuals(best.fit),col=c("blue","red")[smoking2$cursmoke])
+abline(h=0,lty=2,col="grey")
+lines(lowess(predict(best.fit),residuals(best.fit)),col="black",lwd=2)
+rl=loess(residuals(best.fit)~predict(best.fit))
+y=predict(rl,se=TRUE)
+segments(predict(best.fit),y$fit+2*y$se.fit,predict(best.fit),y$fit-2*y$se.fit,col="green")
+summary(best.fit)
+```
+
+We filled out the estimates of coefficients from summary and got:
+$$logit(P(cursmoker_{ij}=1))=13.6221-0.2370*age_{ij}-6.7826*sex_{ij}+0.0543*age_{ij}*sex_{ij}+33.98$$
+**Interpretation**:
+For every one year increase in age, the odds of smoking for men will decrease by 21.09% (p-value < 0.001), while the odds of smoking for women will decrease by 16.70% (p-value < 0.001).
+
+###Relationship between the number of cigarettes smoked per day and age
+For the association between age(or sex) and number of cigarettes per day, we only focused on the subjects who were potential smokers. The results from confounder select function are also in favor of excluding non-smokers in this part of analysis.
+```{r,warning=FALSE}
+smoking.cigar = smoking2 %>% 
+  filter(cursmoke!=0)
+
+smoking.cigar %>% 
+  ggplot(aes(x = cigpday)) + geom_histogram(bins = 30) + ggtitle("Distribution of number of cigaretts smoked per day") + theme(plot.title = element_text(hjust = 0.5)) 
+ggplot(subset(confounder,cursmoke==1),aes(x=age,y=cigpday))+
+  geom_jitter(height = 0.2, width = 3)+
+  geom_smooth()+facet_wrap(~sex) +labs(title="Cigarettes per day vs. stratified by sex") 
+
+
+confounder %>%
+  find_cnfd(data =., Y = 8, method = "poisson")
+```
+
+We fitted Poisson regression model with mixed effect to study the relationship between  age and sex with the number of cigarettes smoked per day. Next, we seleced the final model based on AIC criteria. 
+
+```{r,warning=FALSE}
+#random intercept without interaction  
+fit5=glmer(cigpday ~ age + sex + (1|randid), data =smoking.cigar, family = poisson)
+#random intercept with interaction
+fit6=glmer(cigpday ~ age*sex + (1|randid), data =smoking.cigar, family = poisson)
+#random intercept and slope without interaction
+fit7=glmer(cigpday ~ age + sex + (age|randid), data =smoking.cigar, family = poisson)
+#random intercept and slope without interaction
+fit8=glmer(cigpday ~ age*sex + (age|randid), data =smoking.cigar, family = poisson)
+
+# model selection
+tibble(model = c("model1","model2","model3", "model4"), AIC = c(summary(fit5)$AIC[1],summary(fit6)$AIC[1],
+summary(fit7)$AIC[1],summary(fit8)$AIC[1]))
+```
+
+**model4** with random intercept and slope as well as interaction term ends with the lowest AIC value, so we chose model4 as our final model. The residual plot for model4 was shown below.
+
+```{r warning=FALSE}
+best.fit=fit8
+plot(predict(best.fit),residuals(best.fit))
+abline(h=0,lty=2,col="grey")
+lines(lowess(predict(best.fit),residuals(best.fit)),col="black",lwd=2)
+rl=loess(residuals(best.fit)~predict(best.fit))
+y=predict(rl,se=TRUE)
+segments(predict(best.fit),y$fit+2*y$se.fit,predict(best.fit),y$fit-2*y$se.fit,col="green")
+summary(best.fit)
+```
+ **model4**:
+$$log(E(cigpday_{ij}))=\beta_0+(\beta_1+b_{1i})*age_{ij}+\beta_2*sex_{ij}+\beta_3*age_{ij}*sex_{ij}+b_{0i}$$
+
+**Interpretation**:
+The expected number of cigarettes smoked per day will decrease by 0.9954 (p-value = 0.001) with one year increase in age for men. For women, the expected number of cigarettes smoked per day with one year increase in age will decrease by 1.0042 (p-value < 0.001).
+
+###Exploration of Health Outcomes
+```{r}
+mean.sysbp=smoking2 %>%
+  group_by(cursmoke) %>%
+  summarise(mean=mean(sysbp))
+p1=ggplot(data=smoking2,aes(x=sysbp,fill=as.factor(cursmoke),alpha=1/10))+geom_density(position = "stack")+geom_vline(data=mean.sysbp,aes(xintercept=mean,color=as.factor(cursmoke)),linetype="dashed", size=1)+theme(legend.position = "none")
+
+mean.diabp=smoking2 %>%
+  group_by(cursmoke) %>%
+  summarise(mean=mean(diabp))
+
+p2=ggplot(data=smoking2,aes(x=diabp,fill=as.factor(cursmoke),alpha=1/10))+geom_density(position = "stack")+geom_vline(data=mean.diabp,aes(xintercept=mean,color=as.factor(cursmoke)),linetype="dashed", size=1)+theme(legend.position = "none")
+
+mean.totchol=smoking2 %>%
+  group_by(cursmoke) %>%
+  summarise(mean=mean(totchol))
+p3=ggplot(data=smoking2,aes(x=totchol,fill=as.factor(cursmoke),alpha=1/10))+geom_density(position = "stack")+geom_vline(data=mean.totchol,aes(xintercept=mean,color=as.factor(cursmoke)),linetype="dashed", size=1)+theme(legend.position = "none")
+library(gridExtra)
+plot2=grid.arrange(p1,p2,p3,nrow=1)
+
+```
+
+For the relationship between smoking status and certain health outcomes(systolic blood pressure, diastolic blood pressure, serum total cholesterol), we could also fit linear mixed effect models and use AIC criteria to check if we need random slope for variables of interest. Additionally, in the mixed effect models, we could use bootstrapping for calculating p-values for fixed effect.
